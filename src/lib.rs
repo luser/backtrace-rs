@@ -73,6 +73,9 @@
 #[macro_use]
 extern crate std;
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 pub use crate::backtrace::{trace_unsynchronized, Frame};
 mod backtrace;
 

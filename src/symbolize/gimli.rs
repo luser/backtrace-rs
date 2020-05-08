@@ -7,21 +7,22 @@
 use self::gimli::read::EndianSlice;
 use self::gimli::LittleEndian as Endian;
 use crate::symbolize::dladdr;
-use crate::symbolize::ResolveWhat;
+use crate::symbolize::{ResolveWhat, StdFeatures};
 use crate::types::BytesOrWideString;
 use crate::SymbolName;
 use addr2line::gimli;
 use core::convert::TryFrom;
 use core::mem;
+use core::ops::Deref;
 use core::u32;
 use findshlibs::{self, Segment, SharedLibrary};
 use libc::c_void;
-use memmap::Mmap;
-use std::env;
-use std::ffi::OsString;
-use std::fs::File;
-use std::path::Path;
+
+#[cfg(feature = "std")]
 use std::prelude::v1::*;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 const MAPPINGS_CACHE_SIZE: usize = 4;
 
@@ -33,7 +34,7 @@ struct Context<'a> {
 struct Mapping {
     // 'static lifetime is a lie to hack around lack of support for self-referential structs.
     cx: Context<'static>,
-    _map: Mmap,
+    _map: Box<Deref<Target=[u8]>>,
 }
 
 fn cx<'data>(object: Object<'data>) -> Option<Context<'data>> {
@@ -61,7 +62,7 @@ fn cx<'data>(object: Object<'data>) -> Option<Context<'data>> {
     Some(Context { dwarf, object })
 }
 
-fn assert_lifetimes<'a>(_: &'a Mmap, _: &Context<'a>) {}
+fn assert_lifetimes<'a, M: Deref<Target=[u8]>>(_: &'a M, _: &Context<'a>) {}
 
 macro_rules! mk {
     (Mapping { $map:expr, $inner:expr }) => {{
@@ -73,12 +74,6 @@ macro_rules! mk {
             _map: $map,
         }
     }};
-}
-
-fn mmap(path: &Path) -> Option<Mmap> {
-    let file = File::open(path).ok()?;
-    // TODO: not completely safe, see https://github.com/danburkert/memmap-rs/issues/25
-    unsafe { Mmap::map(&file).ok() }
 }
 
 cfg_if::cfg_if! {
@@ -286,8 +281,10 @@ cfg_if::cfg_if! {
 
 impl Mapping {
     #[cfg(not(target_os = "macos"))]
-    fn new(path: &Path) -> Option<Mapping> {
-        let map = mmap(path)?;
+    fn new<S>(path: &S::Path) -> Option<Mapping>
+    where S: StdFeatures,
+    {
+        let map = S::mmap(path)?;
         let cx = cx(Object::parse(&map)?)?;
         Some(mk!(Mapping { map, cx }))
     }
@@ -296,10 +293,10 @@ impl Mapping {
     // different implementation of the function here. On OSX we need to go
     // probing the filesystem for a bunch of files.
     #[cfg(target_os = "macos")]
-    fn new(path: &Path) -> Option<Mapping> {
+    fn new(path: &S::Path) -> Option<Mapping<S>> {
         // First up we need to load the unique UUID which is stored in the macho
         // header of the file we're reading, specified at `path`.
-        let map = mmap(path)?;
+        let map = S::mmap(path)?;
         let macho = MachO::parse(&map, 0).ok()?;
         let uuid = find_uuid(&macho)?;
 
@@ -331,7 +328,7 @@ impl Mapping {
         let inner = cx(Object::parse(macho)?)?;
         return Some(mk!(Mapping { map, inner }));
 
-        fn load_dsym(dir: &Path, uuid: &[u8; 16]) -> Option<Mapping> {
+        fn load_dsym(dir: &M::Path, uuid: &[u8; 16]) -> Option<Mapping> {
             for entry in dir.read_dir().ok()? {
                 let entry = entry.ok()?;
                 let map = mmap(&entry.path())?;
@@ -381,7 +378,7 @@ struct Cache {
 }
 
 struct Library {
-    name: OsString,
+    name: Vec<u8>,
     segments: Vec<LibrarySegment>,
     bias: findshlibs::Bias,
 }
@@ -481,7 +478,9 @@ impl Cache {
             .next()
     }
 
-    fn mapping_for_lib<'a>(&'a mut self, lib: usize) -> Option<&'a Context<'a>> {
+    fn mapping_for_lib<'a, S>(&'a mut self, lib: usize) -> Option<&'a Context<'a>>
+    where S: StdFeatures,
+    {
         let idx = self.mappings.iter().position(|(idx, _)| *idx == lib);
 
         // Invariant: after this conditional completes without early returning
@@ -501,7 +500,7 @@ impl Cache {
             let path = match self.libraries.get(lib) {
                 Some(lib) => &lib.name,
                 None => {
-                    storage = env::current_exe().ok()?.into();
+                    storage = S::current_exe()?.into();
                     &storage
                 }
             };
@@ -521,7 +520,9 @@ impl Cache {
     }
 }
 
-pub unsafe fn resolve(what: ResolveWhat, cb: &mut FnMut(&super::Symbol)) {
+pub unsafe fn resolve<S>(what: ResolveWhat, cb: &mut FnMut(&super::Symbol))
+  where S: StdFeatures,
+{
     let addr = what.address_or_ip();
     let mut cb = DladdrFallback {
         cb,
@@ -648,6 +649,7 @@ impl Symbol<'_> {
         }
     }
 
+    #[cfg(feature = "std")]
     pub fn filename(&self) -> Option<&Path> {
         match self {
             Symbol::Dladdr(s) => return s.filename(),

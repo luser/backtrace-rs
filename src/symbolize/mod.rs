@@ -10,6 +10,8 @@ cfg_if::cfg_if! {
 use crate::backtrace::Frame;
 use crate::types::BytesOrWideString;
 use core::ffi::c_void;
+use core::borrow::Borrow;
+use core::ops::Deref;
 use rustc_demangle::{try_demangle, Demangle};
 
 /// Resolve an address to a symbol, passing the symbol to the specified
@@ -60,7 +62,7 @@ use rustc_demangle::{try_demangle, Demangle};
 #[cfg(feature = "std")]
 pub fn resolve<F: FnMut(&Symbol)>(addr: *mut c_void, cb: F) {
     let _guard = crate::lock::lock();
-    unsafe { resolve_unsynchronized(addr, cb) }
+    unsafe { resolve_unsynchronized::<F, Std>(addr, cb) }
 }
 
 /// Resolve a previously capture frame to a symbol, passing the symbol to the
@@ -102,7 +104,7 @@ pub fn resolve<F: FnMut(&Symbol)>(addr: *mut c_void, cb: F) {
 #[cfg(feature = "std")]
 pub fn resolve_frame<F: FnMut(&Symbol)>(frame: &Frame, cb: F) {
     let _guard = crate::lock::lock();
-    unsafe { resolve_frame_unsynchronized(frame, cb) }
+    unsafe { resolve_frame_unsynchronized::<F, Std>(frame, cb) }
 }
 
 pub enum ResolveWhat<'a> {
@@ -155,11 +157,12 @@ fn adjust_ip(a: *mut c_void) -> *mut c_void {
 /// # Panics
 ///
 /// See information on `resolve` for caveats on `cb` panicking.
-pub unsafe fn resolve_unsynchronized<F>(addr: *mut c_void, mut cb: F)
+pub unsafe fn resolve_unsynchronized<F, S>(addr: *mut c_void, mut cb: F)
 where
     F: FnMut(&Symbol),
+    S: StdFeatures,
 {
-    resolve_imp(ResolveWhat::Address(addr), &mut cb)
+    resolve_imp::<S>(ResolveWhat::Address(addr), &mut cb)
 }
 
 /// Same as `resolve_frame`, only unsafe as it's unsynchronized.
@@ -171,11 +174,43 @@ where
 /// # Panics
 ///
 /// See information on `resolve_frame` for caveats on `cb` panicking.
-pub unsafe fn resolve_frame_unsynchronized<F>(frame: &Frame, mut cb: F)
+pub unsafe fn resolve_frame_unsynchronized<F, S>(frame: &Frame, mut cb: F)
 where
     F: FnMut(&Symbol),
+    S: StdFeatures,
 {
-    resolve_imp(ResolveWhat::Frame(frame), &mut cb)
+    resolve_imp::<S>(ResolveWhat::Frame(frame), &mut cb)
+}
+
+pub trait PathLike {
+}
+
+pub trait StdFeatures {
+    type Path: PathLike;
+    type PathBuf: Borrow<Self::Path>;
+    type Mmap: Deref<Target=[u8]>;
+    fn mmap(path: &Self::Path) -> Option<Self::Mmap>;
+    fn current_exe() -> Option<Self::PathBuf>;
+}
+
+
+#[cfg(feature = "std")]
+struct Std;
+
+#[cfg(feature = "std")]
+impl StdFeatures for Std {
+    type Path = std::path::Path;
+    type PathBuf = std::path::PathBuf;
+    type Mmap = memmap::Mmap;
+    fn map(path: &Self::Path) -> Option<Self::Mmap> {
+        use std::fs::File;
+        let file = File::open(path).ok()?;
+        // TODO: not completely safe, see https://github.com/danburkert/memmap-rs/issues/25
+        unsafe { Mmap::map(&file).ok() }
+    }
+    fn current_exe() -> Option<Self::PathBuf> {
+        std::env::current_exe().ok()
+    }
 }
 
 /// A trait representing the resolution of a symbol in a file.
@@ -464,7 +499,6 @@ cfg_if::cfg_if! {
         use self::dbghelp::Symbol as SymbolImp;
         unsafe fn clear_symbol_cache_imp() {}
     } else if #[cfg(all(
-        feature = "std",
         feature = "gimli-symbolize",
         any(
             target_os = "linux",
